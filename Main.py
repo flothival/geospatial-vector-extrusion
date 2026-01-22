@@ -380,14 +380,14 @@ def streetGraph_to_pyvista(st_graph, elevation_data=None, z_exaggeration=1.0):
 if __name__ == "__main__":
     # === CONFIGURATION ===
     location = "Montpellier, France"
-    radius = 10000
+    radius = 200
 
     # Options d'affichage
     SHOW_TERRAIN = False           # Afficher le relief/topographie
     SHOW_BUILDINGS = True         # Afficher les bâtiments
     SHOW_STREETS = True           # Afficher les rues
     COLOR_BY_HEIGHT = True        # Colorer les bâtiments selon leur hauteur
-    TERRAIN_RESOLUTION = 1000      # Résolution du terrain
+    TERRAIN_RESOLUTION = 100      # Résolution du terrain
     TERRAIN_EXAGGERATION = 3.0    # Exagération verticale du relief
     BUILDING_EXAGGERATION = 1.0   # Exagération des bâtiments
     STREET_COLOR = 'brown'        # Couleur des rues
