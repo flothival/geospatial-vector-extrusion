@@ -560,4 +560,4 @@ save_to_obj(mesh, "output/ma_ville.obj")
 
 ## Licence
 
-Ce projet est fourni à des fins éducatives.
+MIT
