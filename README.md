@@ -449,7 +449,7 @@ Zoom sur la ville
 
 ### Paris (France)
 
-Voici la page de chargement avec un total de 123 937 batiments
+Voici la page de chargement avec un total de 123 937 bâtiments
 
 <img src="img/Paris/loading rendu.png" width="700">
 
@@ -483,7 +483,7 @@ butte Montmartre :
 
 
 
-### Montpellier (France) Batiments et rues
+### Montpellier (France) Bâtiments et rues
 
 ```python
 location = "Montpellier, France"
