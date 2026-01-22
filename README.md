@@ -229,6 +229,13 @@ Chaque étape parallélisée affiche un pourcentage de progression :
 
 ---
 
+## Utilisation de la projection de Lambert
+
+Afin de respecter au mieux l'affichage et le traitements des données géospatial venant d'OSM (Open Street Map), il nous faut utiliser le format EPSG:2154 plus connut sous le nom de projection de lambert. 
+
+<img src="img/lambert.png">
+
+
 ## Fonctions Détaillées
 
 ### `extract_osm_data(location, radius, download_buildings, download_streets)`
