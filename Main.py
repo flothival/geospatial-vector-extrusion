@@ -11,60 +11,39 @@ import random
 import srtm  # pip install srtm.py
 from pyproj import Transformer
 import sys
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing as mp
+
+# Nombre de cœurs CPU disponibles
+NUM_CORES = mp.cpu_count()
+print(f"⚡ Multiprocessing activé: {NUM_CORES} cœurs CPU disponibles")
+
 
 # ============================================================
 # 2. Extraction des données OSM
 # ============================================================
-# Documentation des tags OSM: https://tagfinder.osm.ch
 
 def extract_osm_data(location, radius=500, download_buildings=True, download_streets=True):
-    """
-    Extrait les empreintes de bâtiments et le réseau routier depuis OpenStreetMap.
-
-    Paramètres:
-        location: Nom du lieu (ex: "Montpellier, France")
-        radius: Rayon de recherche en mètres
-        download_buildings: Télécharger les bâtiments (True/False)
-        download_streets: Télécharger les rues (True/False)
-
-    Retourne:
-        buildings: GeoDataFrame des bâtiments (ou None)
-        streets: Graphe du réseau routier (ou None)
-        center_point: Coordonnées du centre (lat, lon)
-    """
+    """Extrait les empreintes de bâtiments et le réseau routier depuis OpenStreetMap."""
     print(f"\n[1/3] Téléchargement des données OSM pour {location}...")
 
-    # Récupération des coordonnées lat/lon du lieu
     center_point = ox.geocoder.geocode(location)
     print(f"  ✓ Coordonnées: {center_point[0]:.4f}, {center_point[1]:.4f}")
 
     buildings = None
     streets = None
 
-    # Téléchargement des empreintes de bâtiments
     if download_buildings:
         print("  → Téléchargement des bâtiments...", end=" ", flush=True)
-        buildings = ox.features_from_point(
-            center_point,
-            tags={'building': True},
-            dist=radius
-        )
-        # Conversion en projection
+        buildings = ox.features_from_point(center_point, tags={'building': True}, dist=radius)
         buildings = buildings.to_crs(epsg=2154)
         print(f"✓ {len(buildings)} bâtiments")
     else:
         print("  → Bâtiments: ignorés (SHOW_BUILDINGS=False)")
 
-    # Téléchargement du réseau routier (tous types: voiture, piéton, vélo, etc.)
     if download_streets:
         print("  → Téléchargement des rues...", end=" ", flush=True)
-        streets = ox.graph_from_point(
-            center_point,
-            dist=radius,
-            network_type='all',  # Inclut toutes les rues
-            simplify=False
-        )
-        # Conversion en projection 
+        streets = ox.graph_from_point(center_point, dist=radius, network_type='all', simplify=False)
         streets = ox.project_graph(streets, to_crs='epsg:2154')
         print(f"✓ {len(streets.edges)} segments")
     else:
@@ -74,90 +53,54 @@ def extract_osm_data(location, radius=500, download_buildings=True, download_str
 
 
 # ============================================================
-# 2b. Données d'élévation du terrain (SRTM)
+# 2b. Données d'élévation du terrain (SRTM) - PARALLÉLISÉ
 # ============================================================
 
-def create_terrain_mesh(center_point, radius, resolution=50, z_exaggeration=1.0):
-    """
-    Crée un maillage 3D du terrain à partir des données d'élévation SRTM.
-
-    Paramètres:
-        center_point: Coordonnées du centre (lat, lon)
-        radius: Rayon en mètres
-        resolution: Nombre de points par axe (plus = plus détaillé mais plus lent)
-        z_exaggeration: Facteur d'exagération verticale (1.0 = réel, 2.0 = 2x plus haut)
-
-    Retourne:
-        terrain: Maillage PyVista StructuredGrid
-        elevation_data: Objet SRTM pour récupérer l'élévation
-        transformer: Transformateur de coordonnées
-        z_exaggeration: Facteur d'exagération utilisé
-    """
-    print(f"\n[2/3] Téléchargement du terrain ({resolution}x{resolution} points)...")
-
-    # Récupération des données d'élévation SRTM
+def _fetch_elevation_row(args):
+    """Worker pour récupérer une ligne d'élévation."""
+    row_idx, lat_row, lon_row = args
     elevation_data = srtm.get_data()
+    row_elevations = [elevation_data.get_elevation(lat_row[j], lon_row[j]) or 0 for j in range(len(lat_row))]
+    return row_idx, row_elevations
 
-    # Calcul de la boîte englobante en lat/lon (approximation)
+
+def create_terrain_mesh(center_point, radius, resolution=50, z_exaggeration=1.0):
+    """Crée un maillage 3D du terrain avec multiprocessing."""
+    print(f"\n[2/3] Téléchargement du terrain ({resolution}x{resolution} points) sur {NUM_CORES} cœurs...")
+
     lat, lon = center_point
-    # 1 degré de latitude ≈ 111km, la longitude varie selon la latitude
     lat_offset = radius / 111000
     lon_offset = radius / (111000 * np.cos(np.radians(lat)))
 
-    # Création d'une grille de points lat/lon
     lats = np.linspace(lat - lat_offset, lat + lat_offset, resolution)
     lons = np.linspace(lon - lon_offset, lon + lon_offset, resolution)
     lon_grid, lat_grid = np.meshgrid(lons, lats)
 
-    # Récupération de l'élévation pour chaque point avec progression
-    total_points = resolution * resolution
-    elevations = np.zeros_like(lat_grid)
-    for i in range(resolution):
-        for j in range(resolution):
-            elev = elevation_data.get_elevation(lat_grid[i, j], lon_grid[i, j])
-            elevations[i, j] = elev if elev is not None else 0
+    tasks = [(i, lat_grid[i, :], lon_grid[i, :]) for i in range(resolution)]
 
-        # Mise à jour de la progression
-        progress = ((i + 1) * resolution) / total_points * 100
-        sys.stdout.write(f"\r  → Élévation: {progress:.0f}%")
-        sys.stdout.flush()
+    elevations = np.zeros((resolution, resolution))
+    completed = 0
+
+    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
+        for row_idx, row_elevations in executor.map(_fetch_elevation_row, tasks):
+            elevations[row_idx, :] = row_elevations
+            completed += 1
+            sys.stdout.write(f"\r  → Élévation: {completed * 100 // resolution}%")
+            sys.stdout.flush()
 
     print(" ✓")
 
-    # Transformation des coordonnées vers EPSG:2154 
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
     x_grid, y_grid = transformer.transform(lon_grid, lat_grid)
 
-    # Application de l'exagération verticale
     elevations_exaggerated = elevations * z_exaggeration
-
-    # Création du maillage PyVista StructuredGrid
     terrain = pv.StructuredGrid(x_grid, y_grid, elevations_exaggerated)
-    # Stockage de l'élévation réelle pour la colormap
     terrain['elevation'] = elevations.flatten()
 
+    elevation_data = srtm.get_data()
     print(f"  ✓ Altitude: {elevations.min():.0f}m - {elevations.max():.0f}m (exagération: x{z_exaggeration})")
 
     return terrain, elevation_data, transformer, z_exaggeration
-
-
-def get_elevation_at_point(x, y, elevation_data, transformer):
-    """
-    Récupère l'élévation à un point projeté (EPSG:2154).
-
-    Paramètres:
-        x, y: Coordonnées
-        elevation_data: Objet SRTM
-        transformer: Transformateur de coordonnées
-
-    Retourne:
-        Élévation en mètres
-    """
-    # Transformation inverse vers lat/lon
-    transformer_inverse = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-    lon, lat = transformer_inverse.transform(x, y)
-    elev = elevation_data.get_elevation(lat, lon)
-    return elev if elev is not None else 0
 
 
 # ============================================================
@@ -165,58 +108,35 @@ def get_elevation_at_point(x, y, elevation_data, transformer):
 # ============================================================
 
 def generate_footprints_with_heights(buildings):
-    """
-    Convertit les géométries GeoDataFrame en polygones Shapely avec hauteurs réelles.
-    Utilise les attributs OSM 'height' ou 'building:levels' quand disponibles.
-
-    Paramètres:
-        buildings: GeoDataFrame des bâtiments
-
-    Retourne:
-        footprints: Liste de polygones Shapely
-        heights: Liste des hauteurs correspondantes
-    """
+    """Convertit les géométries en polygones avec hauteurs réelles."""
     footprints = []
     heights = []
-
-    # Hauteur par défaut par étage (mètres)
     FLOOR_HEIGHT = 3.0
-    # Hauteur par défaut si aucune donnée disponible
     DEFAULT_HEIGHT = 10.0
 
-    for idx, row in buildings.iterrows():
+    for _, row in buildings.iterrows():
         geom = row.geometry
-
-        # Tentative de récupération de la hauteur réelle depuis OSM
         height = None
 
-        # Vérification de l'attribut 'height' (en mètres)
         if 'height' in buildings.columns and pd.notna(row.get('height')):
             try:
                 h = row['height']
-                # Gestion des chaînes comme "15 m" ou "15"
                 if isinstance(h, str):
                     h = float(h.replace('m', '').replace(' ', ''))
                 height = float(h)
             except (ValueError, TypeError):
                 pass
 
-        # Vérification de l'attribut 'building:levels' (nombre d'étages)
         if height is None and 'building:levels' in buildings.columns and pd.notna(row.get('building:levels')):
             try:
-                levels = float(row['building:levels'])
-                height = levels * FLOOR_HEIGHT
+                height = float(row['building:levels']) * FLOOR_HEIGHT
             except (ValueError, TypeError):
                 pass
 
-        # Utilisation de la hauteur par défaut si pas de données
         if height is None:
             height = DEFAULT_HEIGHT
-
-        # Limitation de la hauteur à des valeurs raisonnables
         height = max(3.0, min(height, 300.0))
 
-        # Gestion des MultiPolygon (plusieurs polygones pour un bâtiment)
         if isinstance(geom, MultiPolygon):
             for poly in geom.geoms:
                 footprints.append(poly)
@@ -224,134 +144,132 @@ def generate_footprints_with_heights(buildings):
         elif isinstance(geom, Polygon):
             footprints.append(geom)
             heights.append(height)
-        # Les points et autres types de géométrie sont ignorés
 
     return footprints, heights
 
 
 # ============================================================
-# 4. Génération des bâtiments 3D
+# 4. Génération des bâtiments 3D - ENTIÈREMENT PARALLÉLISÉ
 # ============================================================
 
-def create_watertight_building(coords, height, ground_elevation=0):
-    """
-    Crée un maillage 3D étanche (watertight) d'un bâtiment avec base, murs et toit.
-
-    Paramètres:
-        coords: Coordonnées du contour du bâtiment
-        height: Hauteur du bâtiment
-        ground_elevation: Élévation du terrain à cet emplacement
-
-    Retourne:
-        points: Tableau numpy des vertices
-        faces: Liste des faces (format PyVista)
-    """
-    # Suppression du dernier point dupliqué des coordonnées
+def _create_building_data(coords, height, ground_elevation):
+    """Crée les données brutes d'un bâtiment (vertices et faces)."""
     coords = coords[:-1]
-    n_points = len(coords)
+    n = len(coords)
 
-    # Création des points pour la base et le sommet (ajout de l'élévation du sol)
-    base_points = np.column_stack((coords, np.full(len(coords), ground_elevation)))
-    top_points = np.column_stack((coords, np.full(len(coords), ground_elevation + height)))
+    # Vertices: base puis toit
+    base = np.column_stack((coords, np.full(n, ground_elevation)))
+    top = np.column_stack((coords, np.full(n, ground_elevation + height)))
+    vertices = np.vstack((base, top))
 
-    # Combinaison de tous les points
-    points = np.vstack((base_points, top_points))
-
-    # Création des faces
+    # Faces
     faces = []
+    # Base
+    faces.extend([n] + list(range(n)))
+    # Toit
+    faces.extend([n] + list(range(n, 2 * n)))
+    # Murs
+    for i in range(n):
+        ni = (i + 1) % n
+        faces.extend([4, i, ni, n + ni, n + i])
 
-    # Ajout de la base (triangle fan)
-    base_face = [n_points] + list(range(n_points))
-    faces.extend(base_face)
-
-    # Ajout du toit (triangle fan)
-    roof_indices = list(range(n_points, n_points * 2))
-    roof_face = [n_points] + roof_indices
-    faces.extend(roof_face)
-
-    # Ajout des murs (quadrilatères)
-    for i in range(n_points):
-        next_i = (i + 1) % n_points
-        wall_face = [4,  # quad (4 sommets)
-                     i, next_i,
-                     n_points + next_i, n_points + i]  # points du sommet
-        faces.extend(wall_face)
-
-    return points, faces
+    return vertices, np.array(faces)
 
 
-def generate_random_color():
-    """
-    Génère une couleur RGB aléatoire.
+def _process_building_batch(args):
+    """Worker pour traiter un lot de bâtiments."""
+    batch_data, z_exaggeration, building_exaggeration = args
 
-    Retourne:
-        Liste [R, G, B] avec valeurs entre 0 et 1
-    """
-    return [random.random() for _ in range(3)]
+    elevation_data = srtm.get_data()
+    transformer_inverse = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+
+    results = []
+    for idx, coords, cx, cy, height in batch_data:
+        # Élévation du sol
+        lon, lat = transformer_inverse.transform(cx, cy)
+        elev = elevation_data.get_elevation(lat, lon) or 0
+        ground_elevation = elev * z_exaggeration
+
+        # Création du bâtiment
+        vertices, faces = _create_building_data(coords, height * building_exaggeration, ground_elevation)
+        results.append((idx, vertices, faces, height))
+
+    return results
 
 
 def extrude_buildings(footprints, heights, elevation_data=None, z_exaggeration=1.0, building_exaggeration=1.0):
-    """
-    Extrude les empreintes 2D en bâtiments 3D avec PyVista.
-    Colore les bâtiments selon leur hauteur: bleu (bas) à rouge (haut).
-
-    Paramètres:
-        footprints: Liste des empreintes de bâtiments (polygones)
-        heights: Liste des hauteurs
-        elevation_data: Données d'élévation SRTM (optionnel)
-        z_exaggeration: Exagération verticale du terrain
-        building_exaggeration: Exagération de la hauteur des bâtiments
-
-    Retourne:
-        city_mesh: Maillage combiné de tous les bâtiments
-        instances_building: Liste des maillages individuels
-    """
-    # Création d'un maillage PyVista vide pour la ville finale
-    city_mesh = pv.PolyData()
-    instances_building = []
-
-    # Transformateur inverse pour obtenir lat/lon depuis les coordonnées projetées
-    transformer_inverse = None
-    if elevation_data is not None:
-        transformer_inverse = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-
+    """Extrude les empreintes 2D en bâtiments 3D - entièrement parallélisé."""
     total = len(footprints)
-    for i, (footprint, height) in enumerate(zip(footprints, heights)):
-        # Récupération des coordonnées de l'empreinte
-        coords = np.array(footprint.exterior.coords)
 
-        # Récupération de l'élévation du sol au centroïde du bâtiment
-        ground_elevation = 0
-        if elevation_data is not None and transformer_inverse is not None:
-            centroid = footprint.centroid
-            lon, lat = transformer_inverse.transform(centroid.x, centroid.y)
-            elev = elevation_data.get_elevation(lat, lon)
-            ground_elevation = (elev if elev is not None else 0) * z_exaggeration
+    if total == 0:
+        return pv.PolyData(), []
 
-        # Création de la géométrie 3D étanche (hauteur avec exagération)
-        points, faces = create_watertight_building(coords, height * building_exaggeration, ground_elevation)
+    print(f"  → Extrusion parallèle de {total} bâtiments sur {NUM_CORES} cœurs...")
 
-        # Création du maillage du bâtiment
-        building = pv.PolyData(points, np.array(faces))
+    # Préparation des données
+    building_data = []
+    for i, (fp, h) in enumerate(zip(footprints, heights)):
+        coords = np.array(fp.exterior.coords)
+        centroid = fp.centroid
+        building_data.append((i, coords, centroid.x, centroid.y, h))
 
-        # Attribution de la valeur de hauteur pour la colormap
-        building['height'] = np.full(building.n_points, height)
+    # Division en lots pour le multiprocessing
+    batch_size = max(1, total // (NUM_CORES * 4))
+    batches = []
+    for i in range(0, total, batch_size):
+        batch = building_data[i:i + batch_size]
+        batches.append((batch, z_exaggeration, building_exaggeration))
 
-        instances_building.append(building)
+    # Traitement parallèle
+    all_results = []
+    completed = 0
 
-        # Ajout au maillage de la ville
-        if city_mesh.n_points == 0:
-            city_mesh = building
-        else:
-            city_mesh = city_mesh.merge(building, merge_points=False)
-
-        # Progression
-        progress = (i + 1) / total * 100
-        sys.stdout.write(f"\r  → Extrusion bâtiments: {progress:.0f}%")
-        sys.stdout.flush()
+    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
+        futures = {executor.submit(_process_building_batch, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            batch_results = future.result()
+            all_results.extend(batch_results)
+            completed += len(batch_results)
+            sys.stdout.write(f"\r  → Extrusion bâtiments: {completed * 100 // total}%")
+            sys.stdout.flush()
 
     print(" ✓")
-    return city_mesh, instances_building
+
+    # Tri par index
+    all_results.sort(key=lambda x: x[0])
+
+    # Fusion rapide: concaténation des vertices et faces
+    print("  → Fusion des meshes...", end=" ", flush=True)
+
+    all_vertices = []
+    all_faces = []
+    all_heights = []
+    vertex_offset = 0
+
+    for idx, vertices, faces, height in all_results:
+        all_vertices.append(vertices)
+        # Décaler les indices des faces
+        adjusted_faces = []
+        i = 0
+        while i < len(faces):
+            n_verts = faces[i]
+            adjusted_faces.append(n_verts)
+            for j in range(1, n_verts + 1):
+                adjusted_faces.append(faces[i + j] + vertex_offset)
+            i += n_verts + 1
+        all_faces.extend(adjusted_faces)
+        all_heights.extend([height] * len(vertices))
+        vertex_offset += len(vertices)
+
+    # Création du mesh unique
+    combined_vertices = np.vstack(all_vertices)
+    combined_faces = np.array(all_faces)
+
+    city_mesh = pv.PolyData(combined_vertices, combined_faces)
+    city_mesh['height'] = np.array(all_heights)
+
+    print("✓")
+    return city_mesh, []
 
 
 # ============================================================
@@ -359,168 +277,177 @@ def extrude_buildings(footprints, heights, elevation_data=None, z_exaggeration=1
 # ============================================================
 
 def save_to_obj(mesh, output_path):
-    """
-    Sauvegarde le modèle 3D au format OBJ.
-
-    Paramètres:
-        mesh: Maillage PyVista à exporter
-        output_path: Chemin du fichier de sortie
-    """
-    # Création du répertoire de sortie s'il n'existe pas
-    output_dir = Path(output_path).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Sauvegarde du maillage en OBJ
+    """Sauvegarde le modèle 3D au format OBJ."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     print(f"Sauvegarde du modèle vers {output_path}")
     mesh.save(output_path)
     print("Export terminé")
 
 
 # ============================================================
-# 6. Conversion du réseau routier
+# 6. Conversion du réseau routier - ENTIÈREMENT PARALLÉLISÉ
 # ============================================================
 
-def streetGraph_to_pyvista(st_graph, elevation_data=None, z_exaggeration=1.0):
-    """
-    Convertit le graphe OSMnx des rues en PolyData PyVista avec lignes.
-    Si elevation_data est fourni, les rues suivent l'élévation du terrain.
+def _process_street_batch(args):
+    """Worker pour traiter un lot de rues."""
+    batch_data, z_exaggeration = args
 
-    Paramètres:
-        st_graph: Graphe NetworkX du réseau routier
-        elevation_data: Données d'élévation SRTM (optionnel)
-        z_exaggeration: Exagération verticale
+    elevation_data = srtm.get_data()
+    transformer_inverse = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
 
-    Retourne:
-        Maillage PyVista PolyData avec lignes
-    """
-    # Conversion du graphe en DataFrame
-    _, edges = ox.graph_to_gdfs(st_graph)
-
-    # Transformateur inverse pour obtenir lat/lon depuis les coordonnées projetées
-    transformer_inverse = None
-    if elevation_data is not None:
-        transformer_inverse = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-
-    def get_elevation_for_coords(x_arr, y_arr):
-        """Récupère l'élévation pour un tableau de coordonnées."""
-        if elevation_data is None or transformer_inverse is None:
-            return np.zeros(len(x_arr))
+    results = []
+    for idx, x_coords, y_coords in batch_data:
         elevations = []
-        for x, y in zip(x_arr, y_arr):
+        for x, y in zip(x_coords, y_coords):
             lon, lat = transformer_inverse.transform(x, y)
-            elev = elevation_data.get_elevation(lat, lon)
-            elevations.append((elev if elev is not None else 0) * z_exaggeration)
-        return np.array(elevations)
+            elev = elevation_data.get_elevation(lat, lon) or 0
+            elevations.append(elev * z_exaggeration)
 
-    # Conversion des arêtes en lignes PyVista
-    pts_list = []
+        z_coords = np.array(elevations) + 0.5 * z_exaggeration
+        pts = np.column_stack((x_coords, y_coords, z_coords))
+        results.append((idx, pts))
+
+    return results
+
+
+def streetGraph_to_pyvista(st_graph, elevation_data=None, z_exaggeration=1.0):
+    """Convertit le graphe des rues en PolyData PyVista - entièrement parallélisé."""
+    _, edges = ox.graph_to_gdfs(st_graph)
     total = len(edges)
+
+    if total == 0:
+        return pv.PolyData()
+
+    print(f"  → Conversion parallèle de {total} rues sur {NUM_CORES} cœurs...")
+
+    # Préparation des données
+    street_data = []
     for idx, geom in enumerate(edges['geometry']):
         x_coords = np.array(geom.xy[0])
         y_coords = np.array(geom.xy[1])
-        # Ajout d'un décalage au-dessus du sol
-        z_coords = get_elevation_for_coords(x_coords, y_coords) + 0.5 * z_exaggeration
-        pts_list.append(np.column_stack((x_coords, y_coords, z_coords)))
+        street_data.append((idx, x_coords, y_coords))
 
-        # Progression
-        progress = (idx + 1) / total * 100
-        sys.stdout.write(f"\r  → Conversion rues: {progress:.0f}%")
-        sys.stdout.flush()
+    # Division en lots
+    batch_size = max(1, total // (NUM_CORES * 4))
+    batches = []
+    for i in range(0, total, batch_size):
+        batch = street_data[i:i + batch_size]
+        batches.append((batch, z_exaggeration))
+
+    # Traitement parallèle
+    all_results = []
+    completed = 0
+
+    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
+        futures = {executor.submit(_process_street_batch, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            batch_results = future.result()
+            all_results.extend(batch_results)
+            completed += len(batch_results)
+            sys.stdout.write(f"\r  → Conversion rues: {completed * 100 // total}%")
+            sys.stdout.flush()
 
     print(" ✓")
 
-    # Concaténation de tous les vertices
-    vertices = np.concatenate(pts_list)
+    # Tri par index
+    all_results.sort(key=lambda x: x[0])
 
-    # Construction des indices de lignes pour PyVista
-    lines = []
-    j = 0
-    for i in range(len(pts_list)):
-        pts = pts_list[i]
-        vertex_length = len(pts)
-        vertex_start = j
-        vertex_end = j + vertex_length - 1
-        vertex_arr = [vertex_length] + list(range(vertex_start, vertex_end + 1))
-        lines.append(vertex_arr)
-        j += vertex_length
+    # Construction rapide du mesh
+    print("  → Fusion des rues...", end=" ", flush=True)
 
-    return pv.PolyData(vertices, lines=np.hstack(lines))
+    all_vertices = []
+    all_lines = []
+    vertex_offset = 0
+
+    for idx, pts in all_results:
+        all_vertices.append(pts)
+        n = len(pts)
+        line = [n] + list(range(vertex_offset, vertex_offset + n))
+        all_lines.extend(line)
+        vertex_offset += n
+
+    vertices = np.vstack(all_vertices)
+    lines = np.array(all_lines)
+
+    print("✓")
+    return pv.PolyData(vertices, lines=lines)
 
 
 # ============================================================
 # 7. CONFIGURATION & VISUALISATION
 # ============================================================
 
-# === CONFIGURATION ===
-location = "Chamonix, France"
-radius = 2000
+if __name__ == "__main__":
+    # === CONFIGURATION ===
+    location = "Millau, France"
+    radius = 30000
 
-# Options d'affichage
-SHOW_TERRAIN = True           # Afficher le relief/topographie
-SHOW_BUILDINGS = True         # Afficher les bâtiments
-SHOW_STREETS = False           # Afficher les rues
-COLOR_BY_HEIGHT = True        # Colorer les bâtiments selon leur hauteur (sinon gris)
-TERRAIN_RESOLUTION = 200       # Résolution du terrain (plus = plus détaillé mais plus lent)
-TERRAIN_EXAGGERATION = 2.0    # Exagération verticale du relief (1.0 = réel)
-BUILDING_EXAGGERATION = 1.0   # Exagération de la hauteur des bâtiments (1.0 = réel)
-STREET_COLOR = 'white'        # Couleur des rues
-# =====================
+    # Options d'affichage
+    SHOW_TERRAIN = True           # Afficher le relief/topographie
+    SHOW_BUILDINGS = True         # Afficher les bâtiments
+    SHOW_STREETS = False           # Afficher les rues
+    COLOR_BY_HEIGHT = True        # Colorer les bâtiments selon leur hauteur
+    TERRAIN_RESOLUTION = 10000      # Résolution du terrain
+    TERRAIN_EXAGGERATION = 2.0    # Exagération verticale du relief
+    BUILDING_EXAGGERATION = 1.0   # Exagération des bâtiments
+    STREET_COLOR = 'red'        # Couleur des rues
+    # =====================
 
-print("=" * 50)
-print(f"  Génération 3D: {location}")
-print(f"  Rayon: {radius}m")
-print("=" * 50)
+    print("=" * 50)
+    print(f"  Génération 3D: {location}")
+    print(f"  Rayon: {radius}m")
+    print("=" * 50)
 
-# Extraction des données OSM (ignore bâtiments/rues si non nécessaires)
-buildings, streets, center_point = extract_osm_data(
-    location, radius,
-    download_buildings=SHOW_BUILDINGS,
-    download_streets=SHOW_STREETS
-)
-
-# Création du maillage de terrain (si activé)
-elevation_data = None
-terrain = None
-z_exag = 1.0
-if SHOW_TERRAIN:
-    terrain, elevation_data, _, z_exag = create_terrain_mesh(
-        center_point, radius,
-        resolution=TERRAIN_RESOLUTION,
-        z_exaggeration=TERRAIN_EXAGGERATION
+    # Extraction des données OSM
+    buildings, streets, center_point = extract_osm_data(
+        location, radius,
+        download_buildings=SHOW_BUILDINGS,
+        download_streets=SHOW_STREETS
     )
-else:
-    print("\n[2/3] Terrain: ignoré (SHOW_TERRAIN=False)")
 
-# Traitement des bâtiments (si activé)
-print(f"\n[3/3] Génération des meshes 3D...")
-mesh = None
-if SHOW_BUILDINGS and buildings is not None:
-    footprints, heights = generate_footprints_with_heights(buildings)
-    print(f"  ✓ {len(footprints)} bâtiments ({min(heights):.0f}m - {max(heights):.0f}m)")
-    mesh, bn_instances = extrude_buildings(footprints, heights, elevation_data, z_exag, BUILDING_EXAGGERATION)
-
-# Conversion du réseau routier (si activé)
-street_mesh = None
-if SHOW_STREETS and streets is not None:
-    street_mesh = streetGraph_to_pyvista(streets, elevation_data, z_exag)
-    print(f"  ✓ {street_mesh.n_points} points de rue")
-
-# Visualisation
-print("\n✓ Ouverture de la visualisation...")
-p = pv.Plotter(border=False)
-
-if SHOW_TERRAIN and terrain is not None:
-    p.add_mesh(terrain, scalars='elevation', cmap='coolwarm', show_edges=False,
-               opacity=0.8, scalar_bar_args={'title': 'Altitude (m)'})
-
-if SHOW_BUILDINGS and mesh is not None:
-    if COLOR_BY_HEIGHT:
-        p.add_mesh(mesh, scalars='height', cmap='coolwarm', show_edges=False,
-                   scalar_bar_args={'title': 'Hauteur (m)'})
+    # Création du terrain
+    elevation_data = None
+    terrain = None
+    z_exag = 1.0
+    if SHOW_TERRAIN:
+        terrain, elevation_data, _, z_exag = create_terrain_mesh(
+            center_point, radius,
+            resolution=TERRAIN_RESOLUTION,
+            z_exaggeration=TERRAIN_EXAGGERATION
+        )
     else:
-        p.add_mesh(mesh, color='gray', show_edges=False)
+        print("\n[2/3] Terrain: ignoré (SHOW_TERRAIN=False)")
 
-if SHOW_STREETS and street_mesh is not None:
-    p.add_mesh(street_mesh, color=STREET_COLOR, line_width=2)
+    # Bâtiments
+    print(f"\n[3/3] Génération des meshes 3D...")
+    mesh = None
+    if SHOW_BUILDINGS and buildings is not None:
+        footprints, heights = generate_footprints_with_heights(buildings)
+        print(f"  ✓ {len(footprints)} bâtiments ({min(heights):.0f}m - {max(heights):.0f}m)")
+        mesh, _ = extrude_buildings(footprints, heights, elevation_data, z_exag, BUILDING_EXAGGERATION)
 
-p.show(title='(c) Florent Labrousse-Lhuissier')
+    # Rues
+    street_mesh = None
+    if SHOW_STREETS and streets is not None:
+        street_mesh = streetGraph_to_pyvista(streets, elevation_data, z_exag)
+        print(f"  ✓ {street_mesh.n_points} points de rue")
+
+    # Visualisation
+    print("\n✓ Ouverture de la visualisation...")
+    p = pv.Plotter(border=False)
+
+    if SHOW_TERRAIN and terrain is not None:
+        p.add_mesh(terrain, scalars='elevation', cmap='coolwarm', show_edges=False,
+                   opacity=0.8, scalar_bar_args={'title': 'Altitude (m)'})
+
+    if SHOW_BUILDINGS and mesh is not None:
+        if COLOR_BY_HEIGHT:
+            p.add_mesh(mesh, scalars='height', cmap='coolwarm', show_edges=False,
+                       scalar_bar_args={'title': 'Hauteur (m)'})
+        else:
+            p.add_mesh(mesh, color='gray', show_edges=False)
+
+    if SHOW_STREETS and street_mesh is not None:
+        p.add_mesh(street_mesh, color=STREET_COLOR, line_width=2)
+
+    p.show(title='Geospatial Vector Extruction')
